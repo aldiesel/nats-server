@@ -2236,7 +2236,8 @@ func (mset *stream) purge(preq *JSApiStreamPurgeRequest) (purged uint64, err err
 
 	// Purge consumers.
 	// Check for filtered purge.
-	if preq != nil && preq.Subject != _EMPTY_ {
+	hasSubject := preq != nil && preq.Subject != _EMPTY_
+	if hasSubject {
 		ss := store.FilteredState(fseq, preq.Subject)
 		fseq = ss.First
 	}
@@ -2247,13 +2248,12 @@ func (mset *stream) purge(preq *JSApiStreamPurgeRequest) (purged uint64, err err
 		o.mu.RLock()
 		// we update consumer sequences if:
 		// no subject was specified, we can purge all consumers sequences
-		doPurge := preq == nil ||
-			preq.Subject == _EMPTY_ ||
+		doPurge := !hasSubject ||
 			// consumer filter subject is equal to purged subject
 			// or consumer filter subject is subset of purged subject,
 			// but not the other way around.
 			o.isEqualOrSubsetMatch(preq.Subject)
-		// Check if a consumer has a wider subject space then what we purged
+		// Check if a consumer has a wider subject space than what we purged
 		var isWider bool
 		if !doPurge && preq != nil && o.isFilteredMatch(preq.Subject) {
 			doPurge, isWider = true, true

@@ -16,6 +16,7 @@ package server
 import (
 	"archive/tar"
 	"bytes"
+	"cmp"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -7697,10 +7698,13 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 	var smv StoreMsg
 	var tombs []msgId
 
+	purgeComplete := func() bool {
+		return maxp > 0 && purged >= maxp
+	}
 	fs.mu.Lock()
 	// We may remove blocks as we purge, so don't range directly on fs.blks
 	// otherwise we may jump over some (see https://github.com/nats-io/nats-server/issues/3528)
-	for i := 0; i < len(fs.blks); i++ {
+	for i := 0; i < len(fs.blks) && !purgeComplete(); i++ {
 		mb := fs.blks[i]
 		mb.mu.Lock()
 
@@ -7718,63 +7722,56 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 			continue
 		}
 
-		if sequence > 1 && sequence <= l {
-			l = sequence - 1
-		}
-
 		if mb.cacheNotLoaded() {
 			mb.loadMsgsWithLock()
 			shouldExpire = true
 		}
 
-		for seq := f; seq <= l; seq++ {
-			if sm, _ := mb.cacheLookup(seq, &smv); sm != nil && eq(sm.subj, subject) {
-				rl := fileStoreMsgSize(sm.subj, sm.hdr, sm.msg)
-				// Do fast in place remove.
-				// Stats
-				if mb.msgs > 0 {
-					// Msgs
-					fs.state.Msgs--
-					mb.msgs--
-					// Bytes, make sure to not go negative.
-					if rl > fs.state.Bytes {
-						rl = fs.state.Bytes
-					}
-					if rl > mb.bytes {
-						rl = mb.bytes
-					}
-					fs.state.Bytes -= rl
-					mb.bytes -= rl
-					// Totals
-					purged++
-					bytes += rl
-				}
-				// PSIM and FSS updates.
-				mb.removeSeqPerSubject(sm.subj, seq)
-				fs.removePerSubject(sm.subj, !noMarkers && fs.cfg.SubjectDeleteMarkerTTL > 0)
-				// Track tombstones we need to write.
-				tombs = append(tombs, msgId{sm.seq, sm.ts})
+		l = max(0, sequence-1, l)
+		for seq := f; seq <= l && !purgeComplete(); seq++ {
+			sm, _ := mb.cacheLookup(seq, &smv)
+			if sm == nil {
+				continue
+			}
+			if !eq(sm.subj, subject) {
+				continue
+			}
+			rl := fileStoreMsgSize(sm.subj, sm.hdr, sm.msg)
+			// Do fast in place remove.
+			// Stats
+			if mb.msgs > 0 {
+				// Msgs
+				fs.state.Msgs--
+				mb.msgs--
+				// Bytes, make sure to not go negative.
+				rl = min(rl, fs.state.Bytes, mb.bytes)
+				fs.state.Bytes -= rl
+				mb.bytes -= rl
+				// Totals
+				purged++
+				bytes += rl
+			}
+			// PSIM and FSS updates.
+			mb.removeSeqPerSubject(sm.subj, seq)
+			fs.removePerSubject(sm.subj, !noMarkers && fs.cfg.SubjectDeleteMarkerTTL > 0)
+			// Track tombstones we need to write.
+			tombs = append(tombs, msgId{sm.seq, sm.ts})
 
-				// Check for first message.
-				if seq == atomic.LoadUint64(&mb.first.seq) {
-					mb.selectNextFirst()
-					if mb.isEmpty() {
-						fs.removeMsgBlock(mb)
-						i--
-						// keep flag set, if set previously
-						firstSeqNeedsUpdate = firstSeqNeedsUpdate || seq == fs.state.FirstSeq
-					} else if seq == fs.state.FirstSeq {
-						fs.state.FirstSeq = atomic.LoadUint64(&mb.first.seq) // new one.
-						fs.state.FirstTime = time.Unix(0, mb.first.ts).UTC()
-					}
-				} else {
-					// Out of order delete.
-					mb.dmap.Insert(seq)
+			// Check for first message.
+			if seq == atomic.LoadUint64(&mb.first.seq) {
+				mb.selectNextFirst()
+				if mb.isEmpty() {
+					fs.removeMsgBlock(mb)
+					i--
+					// keep flag set, if set previously
+					firstSeqNeedsUpdate = firstSeqNeedsUpdate || seq == fs.state.FirstSeq
+				} else if seq == fs.state.FirstSeq {
+					fs.state.FirstSeq = atomic.LoadUint64(&mb.first.seq) // new one.
+					fs.state.FirstTime = time.Unix(0, mb.first.ts).UTC()
 				}
-
-				if maxp > 0 && purged >= maxp {
-					break
-				}
+			} else {
+				// Out of order delete.
+				mb.dmap.Insert(seq)
 			}
 		}
 		// Expire if we were responsible for loading.
@@ -7783,11 +7780,6 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 			mb.tryForceExpireCacheLocked()
 		}
 		mb.mu.Unlock()
-
-		// Check if we should break out of top level too.
-		if maxp > 0 && purged >= maxp {
-			break
-		}
 	}
 	if firstSeqNeedsUpdate {
 		fs.selectNextFirst()
@@ -7795,9 +7787,14 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 	fseq := fs.state.FirstSeq
 
 	// Write any tombstones as needed.
-	for _, tomb := range tombs {
-		if tomb.seq > fseq {
-			fs.writeTombstone(tomb.seq, tomb.ts)
+	if len(tombs) > 0 {
+		tombIdx, tombFound := slices.BinarySearchFunc(tombs, msgId{seq: fseq + 1}, func(a, b msgId) int {
+			return cmp.Compare(a.seq, b.seq)
+		})
+		if tombFound { // first tombstone after first sequence
+			for i := tombIdx; i < len(tombs); i++ {
+				fs.writeTombstone(tombs[i].seq, tombs[i].ts)
+			}
 		}
 	}
 
