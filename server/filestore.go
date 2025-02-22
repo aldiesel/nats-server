@@ -7681,26 +7681,55 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 		}
 	}
 
-	eq, wc := compareFn(subject), subjectHasWildcard(subject)
-	var firstSeqNeedsUpdate bool
-	var bytes uint64
-
-	// If we have a "keep" designation need to get full filtered state so we know how many to purge.
-	var maxp uint64
-	if keep > 0 {
-		ss := fs.FilteredState(1, subject)
-		if keep >= ss.Msgs {
-			return 0, nil
+	type sinfo struct {
+		subject      string
+		eq           func(string, string) bool
+		wc           bool
+		maxp, purged uint64
+	}
+	subjects := strings.Split(subject, ",")
+	sinfos := make([]sinfo, 0, len(subjects))
+	var purgeAny bool
+	for _, subject := range subjects {
+		info := sinfo{
+			subject: subject,
+			eq:      compareFn(subject),
+			wc:      subjectHasWildcard(subject),
 		}
-		maxp = ss.Msgs - keep
+		if keep > 0 {
+			ss := fs.FilteredState(1, subject)
+			maxp := ss.Msgs - keep
+			if maxp < 0 {
+				continue // nothing to purge, less messages than keep target
+			}
+			purgeAny = true
+			info.maxp = maxp
+		}
+		sinfos = append(sinfos, info)
 	}
 
+	// If we have a "keep" designation need to get full filtered state so we know how many to purge.
+	if keep > 0 && !purgeAny {
+		return 0, nil
+	}
+
+	purgeComplete := func() bool {
+		if keep == 0 {
+			return false
+		}
+		for _, sinfo := range sinfos {
+			if sinfo.purged < sinfo.maxp { // have not purged all targets
+				return false
+			}
+		}
+		return true
+	}
+
+	var firstSeqNeedsUpdate bool
+	var bytes uint64
 	var smv StoreMsg
 	var tombs []msgId
 
-	purgeComplete := func() bool {
-		return maxp > 0 && purged >= maxp
-	}
 	fs.mu.Lock()
 	// We may remove blocks as we purge, so don't range directly on fs.blks
 	// otherwise we may jump over some (see https://github.com/nats-io/nats-server/issues/3528)
@@ -7711,69 +7740,77 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 		// If we do not have our fss, try to expire the cache if we have no items in this block.
 		shouldExpire := mb.fssNotLoaded()
 
-		t, f, l := mb.filteredPendingLocked(subject, wc, atomic.LoadUint64(&mb.first.seq))
-		if t == 0 {
-			// Expire if we were responsible for loading.
-			if shouldExpire {
-				// Expire this cache before moving on.
-				mb.tryForceExpireCacheLocked()
-			}
-			mb.mu.Unlock()
-			continue
-		}
-
-		if mb.cacheNotLoaded() {
-			mb.loadMsgsWithLock()
-			shouldExpire = true
-		}
-
-		l = max(0, sequence-1, l)
-		for seq := f; seq <= l && !purgeComplete(); seq++ {
-			sm, _ := mb.cacheLookup(seq, &smv)
-			if sm == nil {
+		for s := 0; s < len(sinfos); s++ {
+			sinfo := &sinfos[s]
+			if keep > 0 && sinfo.purged >= sinfo.maxp {
 				continue
 			}
-			if !eq(sm.subj, subject) {
-				continue
-			}
-			rl := fileStoreMsgSize(sm.subj, sm.hdr, sm.msg)
-			// Do fast in place remove.
-			// Stats
-			if mb.msgs > 0 {
-				// Msgs
-				fs.state.Msgs--
-				mb.msgs--
-				// Bytes, make sure to not go negative.
-				rl = min(rl, fs.state.Bytes, mb.bytes)
-				fs.state.Bytes -= rl
-				mb.bytes -= rl
-				// Totals
-				purged++
-				bytes += rl
-			}
-			// PSIM and FSS updates.
-			mb.removeSeqPerSubject(sm.subj, seq)
-			fs.removePerSubject(sm.subj, !noMarkers && fs.cfg.SubjectDeleteMarkerTTL > 0)
-			// Track tombstones we need to write.
-			tombs = append(tombs, msgId{sm.seq, sm.ts})
-
-			// Check for first message.
-			if seq == atomic.LoadUint64(&mb.first.seq) {
-				mb.selectNextFirst()
-				if mb.isEmpty() {
-					fs.removeMsgBlock(mb)
-					i--
-					// keep flag set, if set previously
-					firstSeqNeedsUpdate = firstSeqNeedsUpdate || seq == fs.state.FirstSeq
-				} else if seq == fs.state.FirstSeq {
-					fs.state.FirstSeq = atomic.LoadUint64(&mb.first.seq) // new one.
-					fs.state.FirstTime = time.Unix(0, mb.first.ts).UTC()
+			t, f, l := mb.filteredPendingLocked(sinfo.subject, sinfo.wc, atomic.LoadUint64(&mb.first.seq))
+			if t == 0 {
+				// Expire if we were responsible for loading.
+				if shouldExpire {
+					// Expire this cache before moving on.
+					mb.tryForceExpireCacheLocked()
 				}
-			} else {
-				// Out of order delete.
-				mb.dmap.Insert(seq)
+				continue
+			}
+
+			if mb.cacheNotLoaded() {
+				mb.loadMsgsWithLock()
+				shouldExpire = true
+			}
+
+			l = max(0, sequence-1, l)
+			for seq := f; seq <= l && (keep == 0 || sinfo.purged < sinfo.maxp); seq++ {
+				sm, _ := mb.cacheLookup(seq, &smv)
+				if sm == nil {
+					continue
+				}
+				if !sinfo.eq(sm.subj, sinfo.subject) {
+					continue
+				}
+				rl := fileStoreMsgSize(sm.subj, sm.hdr, sm.msg)
+				// Do fast in place remove.
+				// Stats
+				if mb.msgs > 0 {
+					// Msgs
+					fs.state.Msgs--
+					mb.msgs--
+					// Bytes, make sure to not go negative.
+					rl = min(rl, fs.state.Bytes, mb.bytes)
+					fs.state.Bytes -= rl
+					mb.bytes -= rl
+					// Totals
+					sinfo.purged++
+					purged++
+					bytes += rl
+				}
+				// PSIM and FSS updates.
+				mb.removeSeqPerSubject(sm.subj, seq)
+				fs.removePerSubject(sm.subj, !noMarkers && fs.cfg.SubjectDeleteMarkerTTL > 0)
+				// Track tombstones we need to write.
+				tombs = append(tombs, msgId{sm.seq, sm.ts})
+
+				// Check for first message.
+				if seq == atomic.LoadUint64(&mb.first.seq) {
+					mb.selectNextFirst()
+					newFirst := seq == fs.state.FirstSeq
+					if mb.isEmpty() {
+						fs.removeMsgBlock(mb)
+						i--
+						// keep flag set, if set previously
+						firstSeqNeedsUpdate = firstSeqNeedsUpdate || newFirst
+					} else if newFirst {
+						fs.state.FirstSeq = atomic.LoadUint64(&mb.first.seq) // new one.
+						fs.state.FirstTime = time.Unix(0, mb.first.ts).UTC()
+					}
+				} else {
+					// Out of order delete.
+					mb.dmap.Insert(seq)
+				}
 			}
 		}
+
 		// Expire if we were responsible for loading.
 		if shouldExpire {
 			// Expire this cache before moving on.

@@ -3704,6 +3704,151 @@ func TestFileStorePurgeExWithSubject(t *testing.T) {
 	})
 }
 
+func TestFileStorePurgeExWithSubjects(t *testing.T) {
+	t.Run("NoKeep", func(t *testing.T) {
+		testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+			fcfg.BlockSize = 1000
+			cfg := StreamConfig{Name: "TEST", Subjects: []string{"foo.>"}, Storage: FileStorage}
+			created := time.Now()
+			fs, err := newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			payload := make([]byte, 20)
+
+			_, _, err = fs.StoreMsg("foo.0", nil, payload, 0)
+			require_NoError(t, err)
+
+			total := 200
+			for i := 0; i < total; i++ {
+				_, _, err = fs.StoreMsg("foo.1", nil, payload, 0)
+				require_NoError(t, err)
+			}
+			for i := 0; i < total; i++ {
+				_, _, err = fs.StoreMsg("foo.2", nil, payload, 0)
+				require_NoError(t, err)
+			}
+			for i := 0; i < total; i++ {
+				_, _, err = fs.StoreMsg("foo.3", nil, payload, 0)
+				require_NoError(t, err)
+			}
+
+			// This should purge all "foo.1" and "foo.2"
+			p, err := fs.PurgeEx("foo.1,foo.2", 1, 0, false)
+			require_NoError(t, err)
+			require_Equal(t, p, uint64(2*total))
+
+			state := fs.State()
+			require_Equal(t, state.Msgs, 201)
+			require_Equal(t, state.FirstSeq, 1)
+			if fss := fs.FilteredState(1, "foo.0"); fss.Msgs != 1 {
+				t.Fatalf("Expected to find 1 `foo.0` msgs, got %d", fss.Msgs)
+			}
+			if fss := fs.FilteredState(1, "foo.3"); fss.Msgs != uint64(total) {
+				t.Fatalf("Expected to find %d `foo.3` msgs, got %d", total, fss.Msgs)
+			}
+
+			// Make sure we can recover same state.
+			fs.Stop()
+			fs, err = newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			before := state
+			if state := fs.State(); !reflect.DeepEqual(state, before) {
+				t.Fatalf("Expected state of %+v, got %+v", before, state)
+			}
+
+			// Also make sure we can recover properly with no index.db present.
+			// We want to make sure we preserve any tombstones from the subject based purge.
+			fs.Stop()
+			os.Remove(filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile))
+
+			fs, err = newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			if state := fs.State(); !reflect.DeepEqual(state, before) {
+				t.Fatalf("Expected state of %+v, got %+v without index.db state", before, state)
+			}
+		})
+	})
+	t.Run("Keep", func(t *testing.T) {
+		testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+			fcfg.BlockSize = 1000
+			cfg := StreamConfig{Name: "TEST", Subjects: []string{"foo.>"}, Storage: FileStorage}
+			created := time.Now()
+			fs, err := newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			payload := make([]byte, 20)
+
+			_, _, err = fs.StoreMsg("foo.0", nil, payload, 0)
+			require_NoError(t, err)
+
+			total := 200
+			for i := 0; i < total; i++ {
+				_, _, err = fs.StoreMsg("foo.1", nil, payload, 0)
+				require_NoError(t, err)
+			}
+			for i := 0; i < total; i++ {
+				_, _, err = fs.StoreMsg("foo.2", nil, payload, 0)
+				require_NoError(t, err)
+			}
+			for i := 0; i < total; i++ {
+				_, _, err = fs.StoreMsg("foo.3", nil, payload, 0)
+				require_NoError(t, err)
+			}
+
+			// This should purge 100 of "foo.1" and "foo.2"
+			p, err := fs.PurgeEx("foo.1,foo.2", 1, 100, false)
+			require_NoError(t, err)
+			require_Equal(t, p, uint64(total))
+
+			state := fs.State()
+			require_Equal(t, state.Msgs, 401)
+			require_Equal(t, state.FirstSeq, 1)
+			if fss := fs.FilteredState(1, "foo.0"); fss.Msgs != 1 {
+				t.Fatalf("Expected to find 1 `foo.0` msgs, got %d", fss.Msgs)
+			}
+			if fss := fs.FilteredState(1, "foo.1"); fss.Msgs != 100 {
+				t.Fatalf("Expected to find 100 `foo.1` msgs, got %d", fss.Msgs)
+			}
+			if fss := fs.FilteredState(1, "foo.2"); fss.Msgs != 100 {
+				t.Fatalf("Expected to find 100 `foo.2` msgs, got %d", fss.Msgs)
+			}
+			if fss := fs.FilteredState(1, "foo.3"); fss.Msgs != uint64(total) {
+				t.Fatalf("Expected to find %d `foo.3` msgs, got %d", total, fss.Msgs)
+			}
+
+			// Make sure we can recover same state.
+			fs.Stop()
+			fs, err = newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			before := state
+			if state := fs.State(); !reflect.DeepEqual(state, before) {
+				t.Fatalf("Expected state of %+v, got %+v", before, state)
+			}
+
+			// Also make sure we can recover properly with no index.db present.
+			// We want to make sure we preserve any tombstones from the subject based purge.
+			fs.Stop()
+			os.Remove(filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile))
+
+			fs, err = newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			if state := fs.State(); !reflect.DeepEqual(state, before) {
+				t.Fatalf("Expected state of %+v, got %+v without index.db state", before, state)
+			}
+		})
+	})
+}
+
 // When the N.idx file is shorter than the previous write we could fail to recover the idx properly.
 // For instance, with encryption and an expiring stream that has no messages, when a restart happens the decrypt will fail
 // since their are extra bytes, and this could lead to a stream sequence reset to zero.
