@@ -16,7 +16,6 @@ package server
 import (
 	"archive/tar"
 	"bytes"
-	"cmp"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -7682,10 +7681,11 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 	}
 
 	type sinfo struct {
-		subject      string
-		eq           func(string, string) bool
-		wc           bool
-		maxp, purged uint64
+		subject            string
+		eq                 func(string, string) bool
+		wc                 bool
+		done               bool
+		maxp, purged, f, l uint64
 	}
 	subjects := strings.Split(subject, ",")
 	sinfos := make([]sinfo, 0, len(subjects))
@@ -7696,29 +7696,27 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 			eq:      compareFn(subject),
 			wc:      subjectHasWildcard(subject),
 		}
-		if keep > 0 {
-			ss := fs.FilteredState(1, subject)
-			maxp := ss.Msgs - keep
-			if maxp < 0 {
-				continue // nothing to purge, less messages than keep target
-			}
-			purgeAny = true
-			info.maxp = maxp
+
+		// If we have a "keep" designation need to get full filtered state so we know how many to purge.
+		ss := fs.FilteredState(1, subject)
+		maxp := ss.Msgs - keep
+		if maxp <= 0 {
+			continue // nothing to purge, less messages than keep target
 		}
+		purgeAny = true
+		info.maxp = maxp
+		info.f, info.l = ss.First, ss.Last
+
 		sinfos = append(sinfos, info)
 	}
 
-	// If we have a "keep" designation need to get full filtered state so we know how many to purge.
-	if keep > 0 && !purgeAny {
+	if !purgeAny {
 		return 0, nil
 	}
 
 	purgeComplete := func() bool {
-		if keep == 0 {
-			return false
-		}
-		for _, sinfo := range sinfos {
-			if sinfo.purged < sinfo.maxp { // have not purged all targets
+		for i := range sinfos {
+			if !sinfos[i].done { // have not purged all targets
 				return false
 			}
 		}
@@ -7742,16 +7740,11 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 
 		for s := 0; s < len(sinfos); s++ {
 			sinfo := &sinfos[s]
-			if keep > 0 && sinfo.purged >= sinfo.maxp {
+			if sinfo.done {
 				continue
 			}
 			t, f, l := mb.filteredPendingLocked(sinfo.subject, sinfo.wc, atomic.LoadUint64(&mb.first.seq))
 			if t == 0 {
-				// Expire if we were responsible for loading.
-				if shouldExpire {
-					// Expire this cache before moving on.
-					mb.tryForceExpireCacheLocked()
-				}
 				continue
 			}
 
@@ -7761,7 +7754,7 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 			}
 
 			l = max(0, sequence-1, l)
-			for seq := f; seq <= l && (keep == 0 || sinfo.purged < sinfo.maxp); seq++ {
+			for seq := f; seq <= l && !sinfo.done; seq++ {
 				sm, _ := mb.cacheLookup(seq, &smv)
 				if sm == nil {
 					continue
@@ -7784,6 +7777,11 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 					sinfo.purged++
 					purged++
 					bytes += rl
+					if sinfo.purged >= sinfo.maxp {
+						sinfo.done = true
+						sinfos = append(sinfos[:s], sinfos[s+1:]...)
+						s--
+					}
 				}
 				// PSIM and FSS updates.
 				mb.removeSeqPerSubject(sm.subj, seq)
@@ -7824,14 +7822,9 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 	fseq := fs.state.FirstSeq
 
 	// Write any tombstones as needed.
-	if len(tombs) > 0 {
-		tombIdx, tombFound := slices.BinarySearchFunc(tombs, msgId{seq: fseq + 1}, func(a, b msgId) int {
-			return cmp.Compare(a.seq, b.seq)
-		})
-		if tombFound { // first tombstone after first sequence
-			for i := tombIdx; i < len(tombs); i++ {
-				fs.writeTombstone(tombs[i].seq, tombs[i].ts)
-			}
+	for _, tomb := range tombs {
+		if tomb.seq > fseq {
+			fs.writeTombstone(tomb.seq, tomb.ts)
 		}
 	}
 
