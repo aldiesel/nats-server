@@ -7754,7 +7754,7 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 			}
 
 			l = max(0, sequence-1, l)
-			for seq := f; seq <= l && !sinfo.done; seq++ {
+			for seq := f; seq <= l && !sinfo.done && s >= 0; seq++ {
 				sm, _ := mb.cacheLookup(seq, &smv)
 				if sm == nil {
 					continue
