@@ -6886,6 +6886,25 @@ const (
 	tbit = 1 << 62
 )
 
+var tonce sync.Once
+var ltime atomic.Int64
+
+func getUnixNano() int64 {
+	tonce.Do(func() {
+		un := time.Now().UnixNano()
+		ltime.Store(un)
+		go func() {
+			ticker := time.NewTicker(1 * time.Millisecond)
+			for t := range ticker.C {
+				un := t.UnixNano()
+				ltime.Store(un)
+			}
+		}()
+	})
+
+	return ltime.Load()
+}
+
 // Will do a lookup from cache.
 // Lock should be held.
 func (mb *msgBlock) cacheLookup(seq uint64, sm *StoreMsg) (*StoreMsg, error) {
@@ -6902,7 +6921,7 @@ func (mb *msgBlock) cacheLookup(seq uint64, sm *StoreMsg) (*StoreMsg, error) {
 
 	// If we have a delete map check it.
 	if mb.dmap.Exists(seq) {
-		mb.llts = time.Now().UnixNano()
+		mb.llts = getUnixNano()
 		return nil, errDeletedMsg
 	}
 
@@ -6933,7 +6952,7 @@ func (mb *msgBlock) cacheLookup(seq uint64, sm *StoreMsg) (*StoreMsg, error) {
 	}
 
 	// Update cache activity.
-	mb.llts = time.Now().UnixNano()
+	mb.llts = getUnixNano()
 
 	li := int(bi) - mb.cache.off
 	if li >= len(mb.cache.buf) {
@@ -6949,6 +6968,92 @@ func (mb *msgBlock) cacheLookup(seq uint64, sm *StoreMsg) (*StoreMsg, error) {
 
 	// Parse from the raw buffer.
 	fsm, err := mb.msgFromBuf(buf, sm, hh)
+	if err != nil || fsm == nil {
+		return nil, err
+	}
+
+	// Deleted messages that are decoded return a 0 for sequence.
+	if fsm.seq == 0 {
+		return nil, errDeletedMsg
+	}
+
+	if seq != fsm.seq {
+		recycleMsgBlockBuf(mb.cache.buf)
+		mb.cache.buf = nil
+		return nil, fmt.Errorf("sequence numbers for cache load did not match, %d vs %d", seq, fsm.seq)
+	}
+
+	// Clear the check bit here after we know all is good.
+	if !hashChecked {
+		mb.cache.idx[seq-mb.cache.fseq] = (bi | cbit)
+	}
+
+	return fsm, nil
+}
+
+// Will do a lookup from cache.
+// Lock should be held.
+func (mb *msgBlock) cacheLookupUnsafe(seq uint64, sm *StoreMsg) (*StoreMsg, error) {
+	if seq < atomic.LoadUint64(&mb.first.seq) || seq > atomic.LoadUint64(&mb.last.seq) {
+		return nil, ErrStoreMsgNotFound
+	}
+
+	// The llseq signals us when we can expire a cache at the end of a linear scan.
+	// We want to only update when we know the last reads (multiple consumers) are sequential.
+	// We want to account for forwards and backwards linear scans.
+	if mb.llseq == 0 || seq < mb.llseq || seq == mb.llseq+1 || seq == mb.llseq-1 {
+		mb.llseq = seq
+	}
+
+	// If we have a delete map check it.
+	if mb.dmap.Exists(seq) {
+		mb.llts = getUnixNano()
+		return nil, errDeletedMsg
+	}
+
+	// Detect no cache loaded.
+	if mb.cache == nil || mb.cache.fseq == 0 || len(mb.cache.idx) == 0 || len(mb.cache.buf) == 0 {
+		var reason string
+		if mb.cache == nil {
+			reason = "no cache"
+		} else if mb.cache.fseq == 0 {
+			reason = "fseq is 0"
+		} else if len(mb.cache.idx) == 0 {
+			reason = "no idx present"
+		} else {
+			reason = "cache buf empty"
+		}
+		mb.fs.warn("Cache lookup detected no cache: %s", reason)
+		return nil, errNoCache
+	}
+	// Check partial cache status.
+	if seq < mb.cache.fseq {
+		mb.fs.warn("Cache lookup detected partial cache: seq %d vs cache fseq %d", seq, mb.cache.fseq)
+		return nil, errPartialCache
+	}
+
+	bi, _, hashChecked, err := mb.slotInfo(int(seq - mb.cache.fseq))
+	if err != nil {
+		return nil, err
+	}
+
+	// Update cache activity.
+	mb.llts = getUnixNano()
+
+	li := int(bi) - mb.cache.off
+	if li >= len(mb.cache.buf) {
+		return nil, errPartialCache
+	}
+	buf := mb.cache.buf[li:]
+
+	// We use the high bit to denote we have already checked the checksum.
+	var hh hash.Hash64
+	if !hashChecked {
+		hh = mb.hh // This will force the hash check in msgFromBuf.
+	}
+
+	// Parse from the raw buffer.
+	fsm, err := mb.msgFromBufUnsafe(buf, sm, hh)
 	if err != nil || fsm == nil {
 		return nil, err
 	}
@@ -7092,6 +7197,76 @@ func (mb *msgBlock) msgFromBuf(buf []byte, sm *StoreMsg, hh hash.Hash64) (*Store
 	if slen > 0 {
 		// Make a copy since sm.subj lifetime may last longer.
 		sm.subj = string(data[:slen])
+	}
+
+	return sm, nil
+}
+
+// Internal function to return msg parts from a raw buffer.
+// Lock should be held.
+func (mb *msgBlock) msgFromBufUnsafe(buf []byte, sm *StoreMsg, hh hash.Hash64) (*StoreMsg, error) {
+	if len(buf) < emptyRecordLen {
+		return nil, errBadMsg
+	}
+	var le = binary.LittleEndian
+
+	hdr := buf[:msgHdrSize]
+	rl := le.Uint32(hdr[0:])
+	hasHeaders := rl&hbit != 0
+	rl &^= hbit // clear header bit
+	dlen := int(rl) - msgHdrSize
+	slen := int(le.Uint16(hdr[20:]))
+	// Simple sanity check.
+	if dlen < 0 || slen > (dlen-recordHashSize) || dlen > int(rl) || int(rl) > len(buf) || rl > rlBadThresh {
+		return nil, errBadMsg
+	}
+	data := buf[msgHdrSize : msgHdrSize+dlen]
+	// Do checksum tests here if requested.
+	if hh != nil {
+		hh.Reset()
+		hh.Write(hdr[4:20])
+		hh.Write(data[:slen])
+		if hasHeaders {
+			hh.Write(data[slen+4 : dlen-recordHashSize])
+		} else {
+			hh.Write(data[slen : dlen-recordHashSize])
+		}
+		if !bytes.Equal(hh.Sum(nil), data[len(data)-8:]) {
+			return nil, errBadMsg
+		}
+	}
+	seq := le.Uint64(hdr[4:])
+	if seq&ebit != 0 {
+		seq = 0
+	}
+	ts := int64(le.Uint64(hdr[12:]))
+
+	// Create a StoreMsg if needed.
+	if sm == nil {
+		sm = new(StoreMsg)
+	} else {
+		sm.clear()
+	}
+	// To recycle the large blocks we can never pass back a reference, so need to copy for the upper
+	// layers and for us to be safe to expire, and recycle, the large msgBlocks.
+	end := dlen - 8
+
+	if hasHeaders {
+		hl := le.Uint32(data[slen:])
+		bi := slen + 4
+		li := bi + int(hl)
+		sm.buf = append(sm.buf, data[bi:end]...)
+		li, end = li-bi, end-bi
+		sm.hdr = sm.buf[0:li:li]
+		sm.msg = sm.buf[li:end]
+	} else {
+		sm.buf = append(sm.buf, data[slen:end]...)
+		sm.msg = sm.buf[0 : end-slen]
+	}
+	sm.seq, sm.ts = seq, ts
+	if slen > 0 {
+		// Make a copy since sm.subj lifetime may last longer.
+		sm.subj = bytesToString(data[:slen])
 	}
 
 	return sm, nil
@@ -7740,7 +7915,7 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 
 		for s := 0; s < len(sinfos); s++ {
 			sinfo := &sinfos[s]
-			if sinfo.done {
+			if sinfo.done || sinfo.f > atomic.LoadUint64(&mb.last.seq) {
 				continue
 			}
 			t, f, l := mb.filteredPendingLocked(sinfo.subject, sinfo.wc, atomic.LoadUint64(&mb.first.seq))
@@ -7757,11 +7932,13 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 				l = sequence - 1
 			}
 			for seq := f; seq <= l && !sinfo.done && s >= 0; seq++ {
-				sm, _ := mb.cacheLookup(seq, &smv)
+				sm, _ := mb.cacheLookupUnsafe(seq, &smv)
 				if sm == nil {
 					continue
 				}
-				if !sinfo.eq(sm.subj, sinfo.subject) {
+				if !sinfo.wc && (sm.subj != sinfo.subject) {
+					continue
+				} else if !sinfo.eq(sm.subj, sinfo.subject) {
 					continue
 				}
 				rl := fileStoreMsgSize(sm.subj, sm.hdr, sm.msg)
