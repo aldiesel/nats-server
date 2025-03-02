@@ -5322,8 +5322,20 @@ func (o *consumer) selectStartingSeqNo() {
 							filters = append(filters, filter.subject)
 						}
 					}
+					var fullWC bool
+					o.mset.cfgMu.RLock()
+					if len(o.mset.cfg.Subjects) > 0 {
+						fullWC = filters[0] == o.mset.cfg.Subjects[0]
+					}
+					o.mset.cfgMu.RUnlock()
 					for _, filter := range filters {
-						if st := o.mset.store.SubjectsTotals(filter); len(st) < numSubjectsThresh {
+						if fullWC { // fetching all subjects in the entire stream is likely to be expensive
+							if mss := o.mset.store.SubjectsState(filter); len(mss) > 0 {
+								for _, ss := range mss {
+									lss.seqs = append(lss.seqs, ss.Last)
+								}
+							}
+						} else if st := o.mset.store.SubjectsTotals(filter); len(st) < numSubjectsThresh {
 							var smv StoreMsg
 							for subj := range st {
 								if sm, err := o.mset.store.LoadLastMsg(subj, &smv); err == nil {
