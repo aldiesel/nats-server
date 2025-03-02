@@ -16,6 +16,7 @@ package server
 import (
 	"archive/tar"
 	"bytes"
+	"cmp"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -5944,6 +5945,48 @@ func (fs *fileStore) writeTombstone(seq uint64, ts int64) error {
 	return lmb.writeTombstone(seq, ts)
 }
 
+// For writing tombstones to our lmb. This version will enforce maximum block sizes.
+// Lock should be held.
+func (fs *fileStore) writeTombstones(tombs []msgId) error {
+	// Grab our current last message block.
+	lmb := fs.lmb
+	var i, start int
+	var err error
+	flush := func() error {
+		for j := start; j < i; j++ {
+			tomb := tombs[j]
+			flush := (j == (i - 1)) || (j == start) // first/last tombstone
+			if err := lmb.writeMsgRecord(emptyRecordLen, tomb.seq|tbit, _EMPTY_, nil, nil, tomb.ts, flush); err != nil {
+				return err
+			}
+		}
+		start = i
+		return nil
+	}
+	for i = 0; i < len(tombs); i++ {
+		if lmb == nil || lmb.blkSize()+emptyRecordLen > fs.fcfg.BlockSize {
+			if lmb != nil && fs.fcfg.Compression != NoCompression {
+				// We've now reached the end of this message block, if we want
+				// to compress blocks then now's the time to do it.
+				go lmb.recompressOnDiskIfNeeded()
+			}
+			if lmb, err = fs.newMsgBlockForWrite(); err != nil {
+				return err
+			}
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	if start < i {
+		if err := flush(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (mb *msgBlock) recompressOnDiskIfNeeded() error {
 	alg := mb.fs.fcfg.Compression
 	mb.mu.Lock()
@@ -7265,7 +7308,6 @@ func (mb *msgBlock) msgFromBufUnsafe(buf []byte, sm *StoreMsg, hh hash.Hash64) (
 	}
 	sm.seq, sm.ts = seq, ts
 	if slen > 0 {
-		// Make a copy since sm.subj lifetime may last longer.
 		sm.subj = bytesToString(data[:slen])
 	}
 
@@ -7913,7 +7955,7 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 		// If we do not have our fss, try to expire the cache if we have no items in this block.
 		shouldExpire := mb.fssNotLoaded()
 
-		for s := 0; s < len(sinfos); s++ {
+		for s := 0; s < len(sinfos) && !mb.isEmpty(); s++ {
 			sinfo := &sinfos[s]
 			if sinfo.done || sinfo.f > atomic.LoadUint64(&mb.last.seq) {
 				continue
@@ -7936,11 +7978,21 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 				if sm == nil {
 					continue
 				}
-				if !sinfo.wc && (sm.subj != sinfo.subject) {
-					continue
+
+				if !sinfo.wc {
+					if sm.subj != sinfo.subject {
+						continue
+					}
 				} else if !sinfo.eq(sm.subj, sinfo.subject) {
 					continue
 				}
+				sinfo.purged++
+				if sinfo.purged >= sinfo.maxp {
+					sinfo.done = true
+					sinfos = append(sinfos[:s], sinfos[s+1:]...)
+					s--
+				}
+
 				rl := fileStoreMsgSize(sm.subj, sm.hdr, sm.msg)
 				// Do fast in place remove.
 				// Stats
@@ -7953,14 +8005,8 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 					fs.state.Bytes -= rl
 					mb.bytes -= rl
 					// Totals
-					sinfo.purged++
 					purged++
 					bytes += rl
-					if sinfo.purged >= sinfo.maxp {
-						sinfo.done = true
-						sinfos = append(sinfos[:s], sinfos[s+1:]...)
-						s--
-					}
 				}
 				// PSIM and FSS updates.
 				mb.removeSeqPerSubject(sm.subj, seq)
@@ -7977,6 +8023,7 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 						i--
 						// keep flag set, if set previously
 						firstSeqNeedsUpdate = firstSeqNeedsUpdate || newFirst
+						break
 					} else if newFirst {
 						fs.state.FirstSeq = atomic.LoadUint64(&mb.first.seq) // new one.
 						fs.state.FirstTime = time.Unix(0, mb.first.ts).UTC()
@@ -8001,9 +8048,14 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 	fseq := fs.state.FirstSeq
 
 	// Write any tombstones as needed.
-	for _, tomb := range tombs {
-		if tomb.seq > fseq {
-			fs.writeTombstone(tomb.seq, tomb.ts)
+	if len(tombs) > 0 {
+		seqc := func(a, b msgId) int {
+			return cmp.Compare(a.seq, b.seq)
+		}
+		slices.SortFunc(tombs, seqc)
+		tidx, _ := slices.BinarySearchFunc(tombs, msgId{seq: fseq + 1}, seqc)
+		if tidx < len(tombs) {
+			fs.writeTombstones(tombs[tidx:])
 		}
 	}
 
