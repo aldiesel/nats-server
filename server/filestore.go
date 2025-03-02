@@ -2446,7 +2446,7 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 	var updateLLTS bool
 	defer func() {
 		if updateLLTS {
-			mb.llts = time.Now().UnixNano()
+			mb.llts = getUnixNano()
 		}
 		mb.mu.Unlock()
 	}()
@@ -2460,7 +2460,7 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 		didLoad = true
 	}
 	// Mark fss activity.
-	mb.lsts = time.Now().UnixNano()
+	mb.lsts = getUnixNano()
 
 	if filter == _EMPTY_ {
 		filter = fwcs
@@ -2638,22 +2638,6 @@ func (mb *msgBlock) filteredPendingLocked(filter string, wc bool, sseq uint64) (
 	// Make sure we have fss loaded.
 	mb.ensurePerSubjectInfoLoaded()
 
-	_tsa, _fsa := [32]string{}, [32]string{}
-	tsa, fsa := _tsa[:0], _fsa[:0]
-	fsa = tokenizeSubjectIntoSlice(fsa[:0], filter)
-
-	// 1. See if we match any subs from fss.
-	// 2. If we match and the sseq is past ss.Last then we can use meta only.
-	// 3. If we match and we need to do a partial, break and clear any totals and do a full scan like num pending.
-
-	isMatch := func(subj string) bool {
-		if !wc {
-			return subj == filter
-		}
-		tsa = tokenizeSubjectIntoSlice(tsa[:0], subj)
-		return isSubsetMatchTokenized(tsa, fsa)
-	}
-
 	var havePartial bool
 	mb.fss.Match(stringToBytes(filter), func(bsubj []byte, ss *SimpleState) {
 		if havePartial {
@@ -2685,6 +2669,22 @@ func (mb *msgBlock) filteredPendingLocked(filter string, wc bool, sseq uint64) (
 	if mb.cacheNotLoaded() {
 		mb.loadMsgsWithLock()
 		shouldExpire = true
+	}
+
+	_tsa, _fsa := [32]string{}, [32]string{}
+	tsa, fsa := _tsa[:0], _fsa[:0]
+	fsa = tokenizeSubjectIntoSlice(fsa[:0], filter)
+
+	// 1. See if we match any subs from fss.
+	// 2. If we match and the sseq is past ss.Last then we can use meta only.
+	// 3. If we match and we need to do a partial, break and clear any totals and do a full scan like num pending.
+
+	isMatch := func(subj string) bool {
+		if !wc {
+			return subj == filter
+		}
+		tsa = tokenizeSubjectIntoSlice(tsa[:0], subj)
+		return isSubsetMatchTokenized(tsa, fsa)
 	}
 
 	var smv StoreMsg
@@ -5386,7 +5386,7 @@ func (mb *msgBlock) expireCacheLocked() {
 	}
 
 	// Grab timestamp to compare.
-	tns := time.Now().UnixNano()
+	tns := getUnixNano()
 
 	// For the core buffer of messages, we care about reads and writes, but not removes.
 	bufts := mb.llts
@@ -5696,7 +5696,7 @@ func (mb *msgBlock) writeMsgRecord(rl, seq uint64, subj string, mhdr, msg []byte
 			return err
 		}
 		// Mark fss activity.
-		mb.lsts = time.Now().UnixNano()
+		mb.lsts = getUnixNano()
 		if ss, ok := mb.fss.Find(stringToBytes(subj)); ok && ss != nil {
 			ss.Msgs++
 			ss.Last = seq
@@ -7932,12 +7932,12 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarke
 	}
 
 	purgeComplete := func() bool {
-		for i := range sinfos {
-			if !sinfos[i].done { // have not purged all targets
-				return false
-			}
-		}
-		return true
+		// for i := range sinfos {
+		// 	if !sinfos[i].done { // have not purged all targets
+		// 		return false
+		// 	}
+		// }
+		return len(sinfos) == 0
 	}
 
 	var firstSeqNeedsUpdate bool
@@ -8939,7 +8939,7 @@ func (mb *msgBlock) ensurePerSubjectInfoLoaded() error {
 	if mb.fss != nil || mb.noTrack {
 		if mb.fss != nil {
 			// Mark fss activity.
-			mb.lsts = time.Now().UnixNano()
+			mb.lsts = getUnixNano()
 		}
 		return nil
 	}
