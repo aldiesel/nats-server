@@ -2689,7 +2689,7 @@ func (mb *msgBlock) filteredPendingLocked(filter string, wc bool, sseq uint64) (
 
 	var smv StoreMsg
 	for seq, lseq := sseq, atomic.LoadUint64(&mb.last.seq); seq <= lseq; seq++ {
-		sm, _ := mb.cacheLookup(seq, &smv)
+		sm, _ := mb.cacheLookupUnsafe(seq, &smv)
 		if sm == nil {
 			continue
 		}
@@ -6399,12 +6399,11 @@ func (mb *msgBlock) indexCacheBuf(buf []byte) error {
 		popFss = true
 	}
 	// Mark fss activity.
-	mb.lsts = time.Now().UnixNano()
+	mb.lsts = getUnixNano()
 	mb.ttls = 0
 
 	lbuf := uint32(len(buf))
 	var seq, ttls uint64
-	var sm StoreMsg // Used for finding TTL headers
 	for index < lbuf {
 		if index+msgHdrSize > lbuf {
 			return errCorruptState
@@ -6481,8 +6480,8 @@ func (mb *msgBlock) indexCacheBuf(buf []byte) error {
 			// Count how many TTLs we think are in this message block.
 			// TODO(nat): Not terribly optimal...
 			if hasHeaders {
-				if fsm, err := mb.msgFromBuf(buf, &sm, nil); err == nil && fsm != nil {
-					if _, err = getMessageTTL(fsm.hdr); err == nil && len(fsm.hdr) > 0 {
+				if hdr, err := mb.headersFromBufUnsafe(buf, nil); err == nil && len(hdr) > 0 {
+					if _, err = getMessageTTL(hdr); err == nil {
 						ttls++
 					}
 				}
@@ -7312,6 +7311,54 @@ func (mb *msgBlock) msgFromBufUnsafe(buf []byte, sm *StoreMsg, hh hash.Hash64) (
 	}
 
 	return sm, nil
+}
+
+// Internal function to return msg parts from a raw buffer.
+// Lock should be held.
+func (mb *msgBlock) headersFromBufUnsafe(buf []byte, hh hash.Hash64) ([]byte, error) {
+	if len(buf) < emptyRecordLen {
+		return nil, errBadMsg
+	}
+	var le = binary.LittleEndian
+
+	hdr := buf[:msgHdrSize]
+	rl := le.Uint32(hdr[0:])
+	hasHeaders := rl&hbit != 0
+	if !hasHeaders {
+		return nil, nil
+	}
+	rl &^= hbit // clear header bit
+	dlen := int(rl) - msgHdrSize
+	slen := int(le.Uint16(hdr[20:]))
+	// Simple sanity check.
+	if dlen < 0 || slen > (dlen-recordHashSize) || dlen > int(rl) || int(rl) > len(buf) || rl > rlBadThresh {
+		return nil, errBadMsg
+	}
+	data := buf[msgHdrSize : msgHdrSize+dlen]
+	// Do checksum tests here if requested.
+	if hh != nil {
+		hh.Reset()
+		hh.Write(hdr[4:20])
+		hh.Write(data[:slen])
+		if hasHeaders {
+			hh.Write(data[slen+4 : dlen-recordHashSize])
+		} else {
+			hh.Write(data[slen : dlen-recordHashSize])
+		}
+		if !bytes.Equal(hh.Sum(nil), data[len(data)-8:]) {
+			return nil, errBadMsg
+		}
+	}
+	seq := le.Uint64(hdr[4:])
+	if seq&ebit != 0 {
+		seq = 0
+	}
+
+	hl := le.Uint32(data[slen:])
+	bi := slen + 4
+	li := bi + int(hl)
+
+	return data[bi : bi+li], nil
 }
 
 // LoadMsg will lookup the message by sequence number and return it if found.
