@@ -4774,24 +4774,29 @@ func convertToHeadersOnly(pmsg *jsPubMsg) {
 	// If headers only do not send msg payload.
 	// Add in msg size itself as header.
 	hdr, msg := pmsg.hdr, pmsg.msg
-	var bb bytes.Buffer
-	if len(hdr) == 0 {
-		bb.WriteString(hdrLine)
-	} else {
-		bb.Write(hdr)
-		bb.Truncate(len(hdr) - LEN_CR_LF)
+	msgLen := len(msg)
+	buf := pmsg.buf[:0]
+	if cap(buf) < cap(msg) {
+		buf = pmsg.msg[:0]
 	}
-	bb.WriteString(JSMsgSize)
-	bb.WriteString(": ")
-	bb.WriteString(strconv.FormatInt(int64(len(msg)), 10))
-	bb.WriteString(CR_LF)
-	bb.WriteString(CR_LF)
-	// Replace underlying buf which we can use directly when we send.
-	// TODO(dlc) - Probably just use directly when forming bytes.Buffer?
+	maxSize := 64 + len(hdr)
+	if cap(buf) < maxSize {
+		buf = make([]byte, 0, maxSize)
+	}
+	if len(hdr) == 0 {
+		buf = append(buf, stringToBytes(hdrLine)...)
+	} else {
+		buf = append(buf, hdr[:len(hdr)-LEN_CR_LF]...)
+	}
+	buf = append(buf, stringToBytes(JSMsgSize)...)
+	buf = append(buf, []byte(": ")...)
+	buf = strconv.AppendInt(buf, int64(msgLen), 10)
+	buf = append(buf, []byte(CR_LF)...)
+	buf = append(buf, []byte(CR_LF)...)
+
 	pmsg.buf = pmsg.buf[:0]
-	pmsg.buf = append(pmsg.buf, bb.Bytes()...)
 	// Replace with new header.
-	pmsg.hdr = pmsg.buf
+	pmsg.hdr = buf
 	// Cancel msg payload
 	pmsg.msg = nil
 }
