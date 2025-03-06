@@ -2957,7 +2957,7 @@ func (fs *fileStore) SubjectsState(subject string) map[string]SimpleState {
 			shouldExpire = true
 		}
 		// Mark fss activity.
-		mb.lsts = time.Now().UnixNano()
+		mb.lsts = getUnixNano()
 		mb.fss.Match(stringToBytes(subject), func(bsubj []byte, ss *SimpleState) {
 			subj := string(bsubj)
 			if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
@@ -7356,9 +7356,8 @@ func (mb *msgBlock) headersFromBufUnsafe(buf []byte, hh hash.Hash64) ([]byte, er
 
 	hl := le.Uint32(data[slen:])
 	bi := slen + 4
-	li := bi + int(hl)
 
-	return data[bi : bi+li], nil
+	return data[bi : bi+int(hl)], nil
 }
 
 // LoadMsg will lookup the message by sequence number and return it if found.

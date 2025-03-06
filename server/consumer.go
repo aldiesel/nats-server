@@ -5336,6 +5336,7 @@ func (o *consumer) selectStartingSeqNo() {
 					for _, filter := range filters {
 						if fullWC { // fetching all subjects in the entire stream is likely to be expensive
 							if mss := o.mset.store.SubjectsState(filter); len(mss) > 0 {
+								lss.seqs = make([]uint64, 0, len(mss))
 								for _, ss := range mss {
 									lss.seqs = append(lss.seqs, ss.Last)
 								}
@@ -5348,6 +5349,7 @@ func (o *consumer) selectStartingSeqNo() {
 								}
 							}
 						} else if mss := o.mset.store.SubjectsState(filter); len(mss) > 0 {
+							lss.seqs = make([]uint64, 0, len(mss))
 							for _, ss := range mss {
 								lss.seqs = append(lss.seqs, ss.Last)
 							}
